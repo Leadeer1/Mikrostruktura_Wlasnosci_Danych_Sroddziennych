@@ -1,0 +1,719 @@
+---
+title: "PROJEKT 1"
+author: "Piotr Filipiak, Kacper Brongiel, Jakub Morawski, Paweł Modzelewski"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true 
+    toc_depth: 2
+    toc_float:
+      collapsed: true
+      smooth_scroll: true
+---
+
+# 1. Analiza danych transakcyjnych
+
+## 1.1. Przygotowanie danych
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(gridExtra)
+#library(lubridate) bo tidyverse
+library(e1071)  
+library(tseries)
+#library(ggplot2) bo tidyverse
+library(forecast)
+library(moments)
+library(rugarch)
+library(patchwork)
+```
+
+```{r}
+dataH <- read.csv("spolkaH.csv", dec=".", sep=";")
+dataL <- read.csv("spolkaL.csv", dec=".", sep=";")
+
+dataH$date_obj <- as.Date(as.character(dataH$daty), format = "%Y%m%d")
+dataL$date_obj <- as.Date(as.character(dataL$daty), format = "%Y%m%d")
+
+#spróbujemy tidyverse:
+
+dataH <- dataH |>
+  mutate(
+    godz6 = sprintf("%06d", godz),
+    #dwukropki
+    czas = paste0(
+      substr(godz6, 1, 2), ":",
+      substr(godz6, 3, 4), ":",
+      substr(godz6, 5, 6)
+    ),
+    znacznik = ymd_hms(paste(daty, czas))
+  ) |>
+  select(znacznik, cena, vol)
+
+dataL <- dataL |>
+  mutate(
+    godz6 = sprintf("%06d", godz),
+    #dwukropki
+    czas = paste0(
+      substr(godz6, 1, 2), ":",
+      substr(godz6, 3, 4), ":",
+      substr(godz6, 5, 6)
+    ),
+    znacznik = ymd_hms(paste(daty, czas))
+  ) |>
+  select(znacznik, cena, vol)
+
+dataH <- dataH |>
+  filter(
+    #daty
+    as_date(znacznik) >= as.Date("2019-01-01") &
+    as_date(znacznik) <= as.Date("2019-06-30"),
+    
+    #godziny
+    znacznik >= floor_date(znacznik, "day") + hours(9) &
+    znacznik <= floor_date(znacznik, "day") + hours(17) + minutes(5)
+  )
+
+dataL <- dataL |>
+  filter(
+    #daty
+    as_date(znacznik) >= as.Date("2019-01-01") &
+    as_date(znacznik) <= as.Date("2019-06-30"),
+    
+    #godziny
+    znacznik >= floor_date(znacznik, "day") + hours(9) &
+    znacznik <= floor_date(znacznik, "day") + hours(17) + minutes(5)
+  )
+```
+
+## 1.2. Statystyki opisowe
+
+### 1.2.1. Kod
+
+```{r}
+stat <- function(x){
+  n <- length(x)
+  summ <- summary(x)
+  sd <- sd(x, na.rm=T)
+  mean_val <- mean(x, na.rm=T)
+  mad_val <- mad(x, na.rm=T)
+  cv_val <- if (mean_val != 0) sd / mean_val else NA
+  skew_val <- if (n >= 3) moments::skewness(x) else NA
+  kurt_val <- if (n >= 4) moments::kurtosis(x) else NA
+  p90 <- quantile(x, 0.90)
+  p95 <- quantile(x, 0.95)
+  
+  c(
+    summ,
+    sd = sd,
+    MAD = mad_val,
+    CV = cv_val,
+    Skweness = skew_val,
+    Kurtosis = kurt_val,
+    P90 = p90,
+    P95 = p95
+  )
+}
+```
+
+```{r}
+old_scipen <- getOption("scipen")
+options(scipen = 9999999)
+```
+
+
+```{r}
+#cena pojedynczej transakcji
+stat(dataH$cena) #H
+stat(dataL$cena) #L
+
+#wolumen pojedynczej transakcji
+stat(dataH$vol) #H
+stat(dataL$vol) #L
+
+#odstęp pomiędzy dwiema kolejnymi transakcjami (uwaga: interesują nas tylko odstępy w trakcie fazy notowań ciągłych)
+dataH <- dataH %>%
+  mutate(
+    znacznik = as.POSIXct(znacznik, tz = "Europe/Warsaw"),
+    wartosc = cena * vol,
+    data = as.Date(znacznik)
+  ) %>%
+  filter(between(hour(znacznik), 9, 16) | (hour(znacznik) == 17 & minute(znacznik) <= 5)) %>%
+  # Grupuj po dniu i oblicz odstep
+  group_by(data) %>%
+  arrange(znacznik) %>%
+  mutate(
+    odstep = as.numeric(difftime(znacznik, lag(znacznik), units = "secs"))
+  ) %>%
+  ungroup()
+
+odstepy_H <- dataH %>%
+  filter(!is.na(odstep), odstep < 86400) %>%  # usuń tylko ekstremalne błędy
+  pull(odstep)
+
+dataH_dzienne <- dataH %>%
+  group_by(data) %>%
+  summarise(
+    liczba_transakcji = n(),
+    dzienny_wolumen = sum(vol, na.rm = TRUE),
+    dzienny_obrot = sum(wartosc, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+print(stat_odstepy_H <- stat(odstepy_H))
+
+#--------------------
+
+dataL <- dataL %>%
+    mutate(
+      znacznik = as.POSIXct(znacznik, tz = "Europe/Warsaw"),
+      wartosc = cena * vol,
+      odstep = as.numeric(difftime(znacznik, lag(znacznik), units = "secs"))
+    )
+
+dataL_clean <- dataL %>%
+  filter(
+    !is.na(odstep),
+    odstep != 600,
+    odstep < 54000
+  )
+
+stat(dataL_clean$odstep) #odstep
+
+dataL_dzienne <- dataL_clean %>%
+    mutate(data = as.Date(znacznik)) %>%
+    group_by(data) %>%
+    summarise(
+      liczba_transakcji = n(),
+      dzienny_wolumen = sum(vol, na.rm = TRUE),
+      dzienny_obrot = sum(wartosc, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+#liczba transakcji w trakcie jednej sesji
+stat(dataH_dzienne$liczba_transakcji)
+stat(dataL_dzienne$liczba_transakcji)
+
+#dzienny wolumen
+stat(dataH_dzienne$dzienny_wolumen)
+stat(dataL_dzienne$dzienny_wolumen)
+
+#dzienna wartość obrotu
+stat(dataH_dzienne$dzienny_obrot)
+stat(dataL_dzienne$dzienny_obrot)
+
+options(scipen = old_scipen)
+```
+
+### 1.2.2. Analiza i interpretacja wyników
+
+#### Cena pojedynczej transakcji
+
+Obie spółki charakteryzują się niską zmiennością cenową, o czym świadczą niewielkie odchylenia standardowe: ok. 0,75 zł dla spółki H oraz ok. 0,28 zł dla spółki L, a także niski współczynnik zmienności: odpowiednio ok. 9,7% i 9,1%. Średnia cena akcji spółki H wynosi 7,69 zł, podczas gdy spółki L wynosi 3,09, czyli jest walorem o dwukrotnie niższym nominale. Mimo różnicy w poziomie cen, rozkłady obu instrumentów są zbliżone pod względem kształtu: skośność bliska 0 oraz umiarkowana kurtoza. Wskazuje to na stabilność w wycenie i brak ekstremalnych odchyleń.
+
+#### Wolumen pojedynczej transakcji
+
+Rozkłady wolumenu poj. transakcji w przypadku obu spółek są silnie skośne w prawo (skośność odpowiednio ponad 56 oraz ponad 95) oraz wykazują ogromną kurtozę, co jest typowe dla rynków finansowych, gdzie dominują małe zlecenia, ale występują sporadyczne bardzo duże transakcje. Średnia wielkość transakcji dla spółki H wynosi zaledwie 174 sztuki, podczas gdy dla spółki L aż 2899 sztuk. Sugeruje to, że mimo niższej ceny akcji inwestorzy operują większymi paczkami akcji. Ponadto maksymalna transakcja dla spółki L przekracza 2,6 mln sztuk, a dla H sięga 1 mln sztuk, co wskazuję na znacznie większą skalę operacji przy spółce L.
+
+#### Odstęp między kolejnymi transakcjami
+
+Obie spółki mają medianę równą zera sekund, co potwierdza zjawisko klastrowania transakcji, gdy wiele zleceń realizowana jest w tej samej sekundzie. Średnie odstępy jednak są znaczące: 11,1 sekundy dla spółki H oraz 17,9 sekundy dla spółki L. Długi czas bez transakcji wskazuje na gorszą płynność spółki. W tym przypadku zarówno H i L osiągają wyniki zbliżone do 46 minut z minimalną różnicą na korzyść H. Wyższe odchylenie standardowe i skośność dla L sugerują częstsze okresy „ciszy”.
+
+#### Liczba transakcji na sesję
+
+Spółka H jest znacznie bardziej aktywna pod względem liczby transakcji (średnio 2606 dziennie, w kontraście do 1613 dla L). Mimo to obie wykazują wysoką zmienność dziennej aktywności, co odczytać można z wysokich wartości odchylenia stand. oraz skośności. Można wnioskować o nieregularnym charakterze zainteresowania rynku, gdzie dni spokojne przeplatają się z dniami gwałtownymi. Mediana H jest zbliżona do średniej, podczas gdy mediana L jest znacznie niższa niż średnia, co dodatkowo potwierdza wpływ rzadkich, aktywnych dni na wartość średniej.
+
+#### Dzienny obrót
+
+Wartość obrotu stanowi dobry miernik płynności finansowej, pod której kątem dominuje spółka H. Średni dzienny obrót wynosi dla niej 34,9 mln zł, podczas gdy dla spółki L jest to ponad połowa mniej, bo 14,6 mln zł. Różnica wynika bezpośrednio z wspomnianej, niższej o ponad połowę od spółki H, ceny jednostkowej akcji spółki L. Mimo wszystko obie spółki cechują się wysoką zmiennością wartości obrotu, bo współczynnik zmienności przekracza 50%, a także zdolnością do generowania bardzo intensywnych dni zakupowych. Maksymalny obrót dla H sięga 130 mlnzł, a dla L 57,5 mln zł. Potwierdza to, że oba walory są w stanie w krótkim czasie przyciągnąć spore środki spekulacyjne lub inwestycyjne, choć skala ta jest wyraźnie większa w przypadku spółki H.
+
+#### Dzienny wolumen
+
+Ze względy na różnicę w wielkości pojedynczej transakcji, spółka L osiąga nieco wyższy średni wolumen niż spółka H. Rozkłady jednak są silnie skośne w prawo i niestabilne, bo współczynniki zmienności przekraczają 0,5. Oznacza to, że obrót w sztukach nie jest stały, ale ulega gwałtownym skokom w reakcji na informacje rynkowe. Maksymalny dzienny wolumen L (ok. 19,7 mln) przewyższa maksymalny wolumen H (ok. 18,5 mln), co sugeruje większą tendencję spółki L do generowania aktywności wolumenowej.
+
+
+## 1.3 Agregacja tick-by-tick (szereg czasowy)
+
+```{r}
+dataH_sekunda <- dataH %>%
+  mutate(
+    znacznik_sekunda = round_date(znacznik, "second"),
+    wartosc = cena*vol
+  ) %>%
+  group_by(znacznik_sekunda) %>%
+  summarise(
+    cena = sum(cena*vol, na.rm=T) / sum(vol, na.rm=T),
+    vol = sum(vol, na.rm=T),
+    wartosc = sum(wartosc, na.rm=T),
+    ile_tickow = n(),
+    .groups = "drop"
+  ) %>%
+  rename(znacznik = znacznik_sekunda) %>%
+  filter(!is.na(cena), cena>0)
+
+dataL_sekunda <- dataL %>%
+  mutate(
+    znacznik_sekunda = round_date(znacznik, "second"),
+    wartosc = cena*vol
+  ) %>%
+  group_by(znacznik_sekunda) %>%
+  summarise(
+    cena = sum(cena*vol, na.rm=T) / sum(vol, na.rm=T),
+    vol = sum(vol, na.rm=T),
+    wartosc = sum(wartosc, na.rm=T),
+    ile_tickow = n(),
+    .groups = "drop"
+  ) %>%
+  rename(znacznik = znacznik_sekunda) %>%
+  filter(!is.na(cena), cena>0)
+```
+
+## 1.4. Agregacja tick-by-tick szeregu czasowego danych do danych jedno-sekundowych i analiza stóp zwrotu spółek
+
+### 1.4.1. Kod do agregacji
+
+```{r}
+dataH_sekunda <- dataH_sekunda %>%
+  mutate(data = as.Date(znacznik)) %>%
+  group_by(data) %>%
+  mutate(log_stopa_zwrotu = log(cena / lag(cena))) %>%
+  ungroup()
+
+stopy_zwrotuH <- dataH_sekunda %>%
+  pull(log_stopa_zwrotu) %>%
+  na.omit()
+
+dataL_sekunda <- dataL_sekunda %>%
+  mutate(data = as.Date(znacznik)) %>%
+  group_by(data) %>%
+  mutate(log_stopa_zwrotu = log(cena / lag(cena))) %>%
+  ungroup()
+
+stopy_zwrotuL <- dataL_sekunda %>%
+  pull(log_stopa_zwrotu) %>%
+  na.omit()
+```
+
+### 1.4.2. Obliczenia i wnioski dla spółki H
+
+#### Skośność i kurtoza
+
+```{r}
+print(skosnoscH <- moments::skewness(stopy_zwrotuH))
+print(kurtozaH <- moments::kurtosis(stopy_zwrotuH))
+```
+
+Wnioski: Kurtoza jest równa 7.767321 i wskazuje to na rozkład silnie leptokurtyczny, znacznie bardziej skupiony wokół średniej niż rozkład normalny, ale jednocześnie z występującymi grubymi ogonami. Oznacza to, że mimo dominacji małych zmian cen, czyli spokojnych sesji, ekstremalne stopy zwrotu pojawiają się znacznie częściej niż przewiduje to rozkład normalny. Jest to typowa cecha dla danych giełdowych, szczególnie przy wysokiej częstotliwości transakcji. Obliczona skośność wynosi -0.08448313, co oznacza, że rozkład logarytmicznych stóp zwrotu jest delikatnie skośny lewostronnie. Wartość ta jest bliska zero, co sugeruje symetryczny rozkład. Dodatnie i ujemne zmiany cen pojawiają się z podobną częstością, choć minimalnie częściej występują spadki.
+
+#### Test Jarque-Bera
+
+```{r}
+jb_test_H <- jarque.bera.test(stopy_zwrotuH)
+cat("Test Jarque-Bera p-value:", jb_test_H$p.value, "\n")
+```
+
+Wnioski: Wartość p-value = 0 pozwala stwierdzić jednoznacznie o odrzuceniu hipotezy $H_0$ o zgodności rozkładu z rozkładem normalnym. Wynik potwierdza, że zarówno skośność jak i kurtoza istotnie różnią się od wartości spodziewanych w rozkładzie N(0,1).
+
+#### Histogram i QQ-plot
+
+```{r}
+p1 <- ggplot(data.frame(x = stopy_zwrotuH), aes(x = x)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 50, fill = "lightblue", color = "black") +
+  stat_function(
+    fun = dnorm,
+    args = list(mean = mean(stopy_zwrotuH, na.rm = TRUE),
+                sd = sd(stopy_zwrotuH, na.rm = TRUE)),
+    color = "red",
+    size = 1
+  ) +
+  labs(
+    title = "Histogram logarytmicznych stóp zwrotu spółki H",
+    x = "Stopa zwrotu",
+    y = "Gęstość"
+  ) +
+  theme_minimal()
+p1
+```
+
+Wnioski: Centralny, najwyższy słupek odpowiada małym, bliskim zeru zmianom cen, to sugeruje dominację „spokojnych” okresów. Na obu końcach histogramu widoczne są niewielkie, ale wyraźne słupki reprezentujące większe, bądź mniejsze stopy zwrotu, ale nie są to bardzo duże wzrosty, czy spadki.
+Czerwona krzywa, czyli gęstość rozkładu normalnego, nie pasuje do kształtu danych. Jest ona zbyt płaska w centrum i zbyt cienka w ogonach.
+
+```{r}
+p2 <- qqnorm(stopy_zwrotuH, main = "QQ-plot stóp zwrotu spółki H oraz rozkład N(0,1)")
+qqline(stopy_zwrotuH, col = "blue", lwd = 3)
+```
+
+Wnioski: Na wykresie QQ-Plot widoczne są wyraźne odchylenia od linii teoretycznej, zwłaszcza w okolicy ogonów rozkładu. Punkty w prawym górnym oraz lewym dolnym rogu wyraźnie odchylają się od prostej, co potwierdza zauważoną wcześniej obecność obserwacji ekstremalnych, czyli grubych ogonów, a co za tym idzie niespełnienia założeń normalności. Rozkład rzeczywistych stóp zwrotu wychodzi poza granice rozkładu normalnego, zwłaszcza w kierunku dużych zmian cen.
+
+#### Wykres autokorelacji stóp zwrotu ACF
+
+```{r}
+acf(stopy_zwrotuH, main = "ACF stóp zwrotu spółki H", lag.max = 200)
+Box.test(stopy_zwrotuH, lag = 10, type = "Ljung-Box")
+```
+
+Wnioski: Zauważalna jest silna, ujemna autokorelacja pierwszego rzędu (< -0,2), bo pierwszy lag wyraźnie wychodzi poza przedział ufności. To typowe zjawisko dla danych wysokiej częstotliwości, bo po każdej transakcji cena często odbija się w przeciwną stronę, co może być efektem mikrostruktury rynku.  
+Dla wyższych opóźnień wartości autokorelacji szybko zanikają i pozostają w obrębie przedziału ufności, co sugeruje, że korelacja nie trwa dłużej niż jedną jednostkę czasu (sekundę). Stopy zwrotu nie są losowe, ale ich zależność jest krótkotrwała.
+
+#### Wykres autokorelacji zmienności |r_t|
+
+```{r}
+acf(abs(stopy_zwrotuH), main = "ACF |r_t| spółki H", lag.max = 200)
+Box.test(abs(stopy_zwrotuH), lag = 10, type = "Ljung-Box")
+```
+
+Wnioski: Wykres ACF zmienności, czyli wartości bezwzględnej stóp zwrotu, pokazuje silną dodatnią autokorelację rzędu 1 (ponad 0,2), która powoli wygasa wraz ze wzrostem lagu. To sygnał o tendencji do pojawiania się kolejnych okresów o wysokiej zmienności po sobie.  
+Dodatnia autokorelacja w długim zakresie oznacza, że wysoka zmienność w okresie t, zwiększa szansę na wysoką zmienność w okresie t+1.
+
+### 1.4.3. Obliczenia i wnioski dla spółki L
+
+#### Skośność i kurtoza
+
+```{r}
+print(skosnoscL <- moments::skewness(stopy_zwrotuL))
+print(kurtozaL <- moments::kurtosis(stopy_zwrotuL))
+```
+
+Wnioski: Kurtoza jest równa 8.497379 i wskazuje to na rozkład silnie leptokurtyczny, znacznie bardziej skupiony wokół średniej niż rozkład normalny, ale jednocześnie z występującymi grubymi ogonami. Oznacza to, że mimo dominacji małych zmian cen, czyli spokojnych sesji, ekstremalne stopy zwrotu pojawiają się znacznie częściej niż przewiduje to rozkład normalny. Jest to typowa cecha dla danych giełdowych, szczególnie przy wysokiej częstotliwości transakcji. Obliczona skośność wynosi -0.01422556, co oznacza, że rozkład logarytmicznych stóp zwrotu jest delikatnie skośny lewostronnie. Wartość ta jest bliska zero, co sugeruje symetryczny rozkład.
+
+#### Test Jarque-Bera
+
+```{r}
+jb_test_L <- jarque.bera.test(stopy_zwrotuL)
+cat("Test Jarque-Bera p-value:", jb_test_L$p.value, "\n")
+```
+
+Wnioski: Wartość p-value = 0 pozwala stwierdzić jednoznacznie o odrzuceniu hipotezy $H_0$ o zgodności rozkładu z rozkładem normalnym. Wynik potwierdza, że zarówno skośność jak i kurtoza istotnie różnią się od wartości spodziewanych w rozkładzie N(0,1), mimo pozornej symetrii.
+
+#### Histogram i QQ-Plot
+
+```{r}
+p1 <- ggplot(data.frame(x = stopy_zwrotuL), aes(x = x)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 50, fill = "lightblue", color = "black") +
+  stat_function(
+    fun = dnorm,
+    args = list(mean = mean(stopy_zwrotuL, na.rm = TRUE),
+                sd = sd(stopy_zwrotuL, na.rm = TRUE)),
+    color = "red",
+    size = 1
+  ) +
+  labs(
+    title = "Histogram logarytmicznych stóp zwrotu spółki L",
+    x = "Stopa zwrotu",
+    y = "Gęstość"
+  ) +
+  theme_minimal()
+p1
+```
+
+Wnioski: Centralny, najwyższy słupek odpowiada małym, bliskim zeru zmianom cen, to sugeruje dominację „spokojnych” okresów. Na obu końcach histogramu widoczne są niewielkie, ale wyraźne słupki reprezentujące ekstremalne stopy zwrotu, zarówno bardzo duże wzrosty, jak i spadki.
+Czerwona krzywa, czyli gęstość rozkładu normalnego, nie pasuje do kształtu danych. Jest ona zbyt płaska w centrum i zbyt cienka w ogonach.
+
+```{r}
+p2 <- qqnorm(stopy_zwrotuL, main = "QQ-plot stóp zwrotu spólki L oraz rozkład N(0,1)")
+qqline(stopy_zwrotuL, col = "blue", lwd = 3)
+```
+
+Wnioski: Na wykresie QQ-Plot widoczne są wyraźne odchylenia od linii teoretycznej, zwłaszcza w okolicy ogonów rozkładu. Punkty w prawym górnym oraz lewym dolnym rogu wyraźnie odchylają się od prostej, co potwierdza zauważoną wcześniej obecność obserwacji ekstremalnych, czyli grubych ogonów, a co za tym idzie niespełnienia założeń normalności. Rozkład rzeczywistych stóp zwrotu wychodzi poza granice rozkładu normalnego, zwłaszcza w kierunku dużych zmian cen.
+
+#### Wykres autokorelacji stóp zwrotu ACF
+
+```{r}
+acf(stopy_zwrotuL, main = "ACF stóp zwrotu spółki L", lag.max = 200)
+Box.test(stopy_zwrotuL, lag = 10, type = "Ljung-Box")
+```
+
+Wnioski: Zauważalna jest silna, ujemna autokorelacja pierwszego rzędu (ok.-0,4), bo pierwszy lag wyraźnie wychodzi poza przedział ufności. To typowe zjawisko dla danych wysokiej częstotliwości, bo po każdej transakcji cena często odbija się w przeciwną stronę, co może być efektem mikrostruktury rynku.  
+Dla wyższych opóźnień wartości autokorelacji szybko zanikają i pozostają w obrębie przedziału ufności, co sugeruje, że korelacja nie trwa dłużej niż jedną jednostkę czasu (sekundę). Stopy zwrotu nie są losowe, ale ich zależność jest krótkotrwała.
+
+#### Wykres autokorelacji zmienności |r_t|
+
+```{r}
+acf(abs(stopy_zwrotuL), main = "ACF |r_t| spółki L", lag.max = 200)
+Box.test(abs(stopy_zwrotuL), lag = 10, type = "Ljung-Box")
+```
+
+Wnioski: Wykres ACF zmienności, czyli wartości bezwzględnej stóp zwrotu, pokazuje silną dodatnią autokorelację rzędu 1 (około 0,3), która wraz ze wzrostem lagu zaczyna oscylować wokół wartości 0,1. To oznacza, że zmienność zachowuje się bardziej chaotycznie, ale z niewielką trwałą pamięcią. Nawet po wielu opóźnieniach nadal istnieje słaba, ale statystycznie istotna zależność między kolejnymi wartościami zmienności. To wskazuje na mniejszą możliwość przewidywania zmienności dla tej spółki, właśnie ze wsględu na powolne wygasanie autokorelacji. Modelowanie może wymagać innych podejść.
+
+---
+
+# 2. Analiza danych pięciominutowych
+
+Aby zminimalizować efekt
+
+## 2.1. Agregacja do 5-minutowych interwałów
+
+```{r}
+#funkcja pomocnicza
+przetworz_5min <- function(data_sekunda) {
+  
+  #agregacja do 5-minutowych interwalow
+  data_5min <- data_sekunda %>%
+    mutate(
+      interval_5min = floor_date(znacznik, "5 minutes")
+    ) %>%
+    group_by(interval_5min) %>%
+    summarise(
+      close_price = last(cena),
+      volume = sum(vol, na.rm = TRUE),
+      trans_count = sum(ile_tickow, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(data_sesji = as.Date(interval_5min))
+  
+  #dla kazdego dnia znajduje ostatnia cene przed 17:00
+  data_final <- data_5min %>%
+    group_by(data_sesji) %>%
+    arrange(interval_5min) %>%
+    mutate(
+      #czy dany interwał jest poza godzinami ciaglymi
+      is_overtime = interval_5min >= ymd_hms(paste(data_sesji, "17:00:00")),
+      
+      #ostatnia cena z sesji ciaglej (przed 17:00)
+      last_cont_price = close_price[!is_overtime][length(close_price[!is_overtime])],
+      
+      #lag: dla dogrywki użyj last_cont_price, inaczej standardowy lag
+      lag_price = ifelse(is_overtime, last_cont_price, lag(close_price))
+    ) %>%
+    ungroup() %>%
+    mutate(
+      log_ret = log(close_price / lag_price),
+      log_vol = log(volume)
+    ) %>%
+    filter(!is.na(log_ret), is.finite(log_vol)) %>%
+    mutate(pora_dnia = format(interval_5min, "%H:%M")) %>%
+    select(-is_overtime, -last_cont_price, -lag_price)
+  
+  return(data_final)
+}
+```
+
+```{r}
+dataH_sekunda <- dataH %>%
+  mutate(
+    znacznik_sekunda = round_date(znacznik, "second"),
+    wartosc = cena*vol
+  ) %>%
+  group_by(znacznik_sekunda) %>%
+  summarise(
+    cena = sum(cena*vol, na.rm=T) / sum(vol, na.rm=T),
+    vol = sum(vol, na.rm=T),
+    wartosc = sum(wartosc, na.rm=T),
+    ile_tickow = n(),
+    .groups = "drop"
+  ) %>%
+  rename(znacznik = znacznik_sekunda) %>%
+  filter(!is.na(cena), cena>0)
+
+dataL_sekunda <- dataL %>%
+  mutate(
+    znacznik_sekunda = round_date(znacznik, "second"),
+    wartosc = cena*vol
+  ) %>%
+  group_by(znacznik_sekunda) %>%
+  summarise(
+    cena = sum(cena*vol, na.rm=T) / sum(vol, na.rm=T),
+    vol = sum(vol, na.rm=T),
+    wartosc = sum(wartosc, na.rm=T),
+    ile_tickow = n(),
+    .groups = "drop"
+  ) %>%
+  rename(znacznik = znacznik_sekunda) %>%
+  filter(!is.na(cena), cena>0)
+
+dataH_sekunda <- dataH_sekunda %>%
+  mutate(
+    znacznik = case_when(
+      hour(znacznik) == 17 & minute(znacznik) <= 5 ~ 
+        znacznik - minutes(minute(znacznik)) - seconds(second(znacznik)),
+      TRUE ~ znacznik
+    )
+  )
+
+dataL_sekunda <- dataL_sekunda %>%
+  mutate(
+    znacznik = case_when(
+      hour(znacznik) == 17 & minute(znacznik) <= 5 ~ 
+        znacznik - minutes(minute(znacznik)) - seconds(second(znacznik)),
+      TRUE ~ znacznik
+    )
+  )
+
+dataH_sekunda <- dataH_sekunda %>%
+  mutate(data = as.Date(znacznik)) %>%
+  group_by(data) %>%
+  mutate(log_stopa_zwrotu = log(cena / lag(cena))) %>%
+  ungroup()
+
+stopy_zwrotuH <- dataH_sekunda %>%
+  pull(log_stopa_zwrotu) %>%
+  na.omit()
+
+dataL_sekunda <- dataL_sekunda %>%
+  mutate(data = as.Date(znacznik)) %>%
+  group_by(data) %>%
+  mutate(log_stopa_zwrotu = log(cena / lag(cena))) %>%
+  ungroup()
+
+stopy_zwrotuL <- dataL_sekunda %>%
+  pull(log_stopa_zwrotu) %>%
+  na.omit()
+
+dataH_5min <- przetworz_5min(dataH_sekunda)
+dataL_5min <- przetworz_5min(dataL_sekunda)
+
+```
+
+## 2.2. Obliczanie średnich przekrojowych (profile dzienne)
+
+```{r}
+intraday_means <- function(df){
+  df %>%
+    group_by(pora_dnia) %>%
+    summarise(
+      mean_ret = mean(log_ret, na.rm = T),
+      mean_count = mean(trans_count, na.rm = T),
+      mean_log_vol = mean(log(volume+1), na.rm = T),
+      mean_abs_ret = mean(abs(log_ret), na.rm=T)
+    ) %>% 
+    mutate(time_plot = as.POSIXct(paste("2020-01-01", pora_dnia)))
+}
+
+intradayH <- intraday_means(dataH_5min)
+intradayL <- intraday_means(dataL_5min)
+
+```
+
+## 2.3. Kod tworzący wykresy
+
+```{r}
+plot_intraday <- function(df_seas, company_name) {
+  
+  breaks_vec <- unique(df_seas$pora_dnia)
+  breaks_vec <- breaks_vec[seq(1, length(breaks_vec), by = 6)] 
+  
+
+  p1 <- ggplot(df_seas, aes(x = pora_dnia, y = mean_ret, group = 1)) +
+    geom_line(color = "darkgreen") +
+    geom_hline(yintercept = 0, linetype="dashed", color="gray") +
+    scale_x_discrete(breaks = breaks_vec) +
+    labs(title = paste("1. Przekrojowe średnie stopy zwrotu -", company_name),
+         x = "Godzina", y = "Średnia stopa zwrotu") +
+    theme_minimal() + 
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5))
+
+  p2 <- ggplot(df_seas, aes(x = pora_dnia, y = mean_count, group = 1)) +
+    geom_line(color = "purple", size=1) +
+    scale_x_discrete(breaks = breaks_vec) +
+    labs(title = paste("2. Średnia liczba transakcji -", company_name),
+         x = "Godzina", y = "Liczba transakcji") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5))
+  
+  p3 <- ggplot(df_seas, aes(x = pora_dnia, y = mean_log_vol, group=1)) +
+    geom_line(color = "steelblue", size=1) +
+    scale_x_discrete(breaks = breaks_vec) +
+    labs(title = paste("3. Średni log-wolumen -", company_name),
+         x = "Godzina", y = "Log(Wolumen)") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5))
+   
+
+  p4 <- ggplot(df_seas, aes(x = pora_dnia, y = mean_abs_ret, group = 1)) +
+    geom_line(color = "red", size=1) +
+    scale_x_discrete(breaks = breaks_vec) + 
+    labs(title = paste("4. Sezonowość zmienności (|r_t|) -", company_name),
+         subtitle = "Wykres ciągły (bez przerwy przed dogrywką)",
+         x = "Godzina", y = "Średnia |stopa zwrotu|") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5))
+  
+  return(list(p1 = p1, p2 = p2, p3 = p3, p4 = p4))
+}
+```
+
+## 2.4. Wykresy dotyczące spółki H
+
+```{r}
+wykresyH <- plot_intraday(intradayH, "Spółka H")
+```
+
+### 2.4.1. Przekrojowe średnie 5-minutowe stopy zwrotu
+
+```{r}
+wykresyH$p1
+```
+
+Na wykresie przedstawiono przekrojową średnią 5-minutowych logarytmicznych stóp zwrotu dla spółki H, obliczoną dla każdej godziny sesji handlowej. Dane zostały przetworzone metodą last-tick w 5-minutowych oknach, z wyłączeniem transakcji overnight.  
+
+Wnioski: Wartości średnich stóp zwrotu oscylują bardzo blisko zera przez cały dzień, a amplituda oscylacji jest rzędu 0,001. To oznacza, że brak trwałego trendu w dowolnym fragmencie dnia. Zarówno rano, jak i po południu, ani pod koniec sesji nie obserwuje się systematycznej dodatniej lub ujemnej tendencji. Wahania są losowe i niewielkie, co potwierdza hipotezę słabej formy efektywności rynku: w krótkich interwałach czasowych oczekiwana stopa zwrotu jest bliska zeru, a arbitrażowe możliwości są minimalne.
+Ten wykres prezentuje typowy obraz akcji o umiarkowanej płynności i braku silnych impulsów w ciągu sesji. Inwestorzy nie generują nadwyżek zysków, co oznacza że rynek szybko absorbuje informacje i nie pozostawia okien czasowych z okazją do zarobku.
+
+### 2.4.2. Przekrojowa średnia liczba transakcji
+
+```{r}
+wykresyH$p2
+```
+
+Wykres przedstawia średnią liczbę transakcji zawieranych w każdym 5-minutowym oknie, agregowanych na przekrój dni.  
+
+Wnioski: Początek sesji charakteryzuje się najwyższą aktywnością, średnio ponad 35 transakcji na okno 5-minutowe. Później zauważalny stopniowy spadek do około 20 transakcji w okolicach 13:00 - 13:30. Po 14:00 można zauważyć powolny wzrost, przyspieszający około 15:30. Co ciekawe to właśnie o tej godzinie otwiera się giełda amerykańska, więc to nie przypadek. Liczba transakcji osiąga szczyt w dogrywce - ponownie przekracza 30.
+Wykres ma kształt litery U, choć jest nieco „rozciągnięty” – z wyraźnym minimum w środku dnia i dwoma szczytami: rano i późnym popołudniem.
+
+
+### 2.4.3. Średni log-wolumen
+
+```{r}
+wykresyH$p3
+```
+
+Wykres przedstawia średni logarytmiczny wolumen transakcji w 5-minutowych oknach. Skala logarytmiczna pozwala na lepsze porównanie wielkości wolumenu między różnymi godzinami.  
+
+Wnioski: Najwyższy log-wolumen w początku sesji, oscyluje wokół 10,25, co przekłada się na wolumen $e^{10,25} \approx 28000$ jednostek. Minimum wolumenu występuje w godzinach wczesnego popołudnia gdy log-wolumen spada do 9,25, co odpowiada $e^{9,25} \approx 10000$. Wzrost wolumenu w godzinach popołudniowych, od około 15:30, ponownie wpływ giełdy amerykańskiej.  
+Wykres jest dość podobny do wykresu liczby transakcji, ale znacznie bardziej wyraźny, co sugeruje, że wolumen jest napędzany liczbą transakcji, a nie ich rozmiarem.
+
+### 2.4.4. Sezonowość zmienności (|r_t|)
+
+```{r}
+wykresyH$p4
+```
+
+Wykres przedstawia średnią wartość bezwzględną 5-minutowych stóp zwrotu (|r_t|), czyli zmienność, w każdym oknie czasowym.  
+
+Wnioski: Najwyższa zmienność występuje tuż po rozpoczęciu sesji (10:05), średnia |r_t| wynosi 0,0025.
+Następnie następuje szybki spadek do poziomu 0,0010–0,0012 w godzinach 11:00–14:00.
+Po 15:30 obserwuje się wzrost zmienności, który utrzymuje się do końca sesji – średnio na poziomie 0,0012–0,0015.
+Wysoka zmienność, za którą idzie kształt wykresu sugeruje reakcję rynku na informacje z nocy, zleceń nagromadzonych przez noc, a także bid-ask bounce przy otwarciu. W południe rynek się stabilizuje, brak nowych informacji. Od popołudnia wzrost zmienności związany z domknięciem pozycji i reakcją na notowania giełdy amerykańskiej.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
