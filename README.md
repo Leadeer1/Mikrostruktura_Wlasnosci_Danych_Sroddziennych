@@ -10,7 +10,7 @@
   * moments
   * R Markdown  
 
-**Problem**
+**Problem**  
 Konieczność zbadania własności mikrostrukturalnych danych transakcyjnych dwóch spółek giełdowych o zróżnicowanym poziomie cen i płynności, w tym identyfikacja śróddziennej sezonowości zmienności oraz weryfikacja założeń o rozkładzie stóp zwrotu w kontekście hipotezy efektywności rynku.  
 
 **Rozwiązanie**
